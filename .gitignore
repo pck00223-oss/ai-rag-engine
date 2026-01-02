@@ -1,0 +1,45 @@
+# ========= Build =========
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# ========= Binaries =========
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.tlog
+*.idb
+
+# ========= Models / Data =========
+models/*.gguf
+models/*.bin
+models/*.safetensors
+data/
+datasets/
+
+# ========= Python / Venv =========
+.venv/
+__pycache__/
+*.pyc
+
+# ========= Visual Studio / VSCode =========
+.vs/
+.vscode/
+*.user
+*.suo
+*.vcxproj*
+*.filters
+*.opendb
+*.db
+
+# ========= OS =========
+.DS_Store
+Thumbs.db
