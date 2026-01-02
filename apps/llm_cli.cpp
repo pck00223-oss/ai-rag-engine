@@ -27,6 +27,15 @@ static const char *get_arg(int &i, int argc, char **argv)
     return argv[++i];
 }
 
+// ---------- UTF-8 console ----------
+static void win32_enable_utf8_console()
+{
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+}
+
 // ---------- stop sequence detector ----------
 static bool ends_with_any(const std::string &s, const std::vector<std::string> &stops)
 {
@@ -40,7 +49,7 @@ static bool ends_with_any(const std::string &s, const std::vector<std::string> &
     return false;
 }
 
-static void trim_at_stop(std::string &s, const std::vector<std::string> &stops)
+static void trim_at_stop_first_occurrence(std::string &s, const std::vector<std::string> &stops)
 {
     size_t cut = std::string::npos;
     for (const auto &t : stops)
@@ -55,49 +64,103 @@ static void trim_at_stop(std::string &s, const std::vector<std::string> &stops)
         s.resize(cut);
 }
 
-static void win32_enable_utf8_console()
+// ---------- force "one sentence" postprocess ----------
+static size_t find_first_sentence_end_zh(const std::string &s)
 {
-#ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-#endif
+    // UTF-8 for "。！？"
+    static const std::vector<std::string> ends = {u8"。", u8"！", u8"？"};
+    size_t best = std::string::npos;
+    for (const auto &e : ends)
+    {
+        size_t p = s.find(e);
+        if (p != std::string::npos)
+        {
+            size_t endpos = p + e.size();
+            best = (best == std::string::npos) ? endpos : std::min(best, endpos);
+        }
+    }
+    // also treat newline as sentence end if it appears earlier
+    size_t nl = s.find('\n');
+    if (nl != std::string::npos)
+    {
+        best = (best == std::string::npos) ? nl : std::min(best, nl);
+    }
+    return best;
 }
 
-#ifdef _WIN32
-// UTF-16 -> UTF-8
-static std::string wide_to_utf8(const wchar_t *w)
+static void normalize_one_sentence(std::string &s)
 {
-    if (!w)
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 1)
-        return {};
-    std::string s((size_t)len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), len, nullptr, nullptr);
-    return s;
-}
-#endif
+    // remove \r
+    s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
 
-// 把原 main 的内容放到这里
-static int real_main(int argc, char **argv)
+    // cut at first sentence end
+    size_t cut = find_first_sentence_end_zh(s);
+    if (cut != std::string::npos)
+        s.resize(cut);
+
+    // trim leading/trailing spaces/newlines
+    auto is_ws = [](unsigned char c)
+    { return c == ' ' || c == '\t' || c == '\n'; };
+    while (!s.empty() && is_ws((unsigned char)s.front()))
+        s.erase(s.begin());
+    while (!s.empty() && is_ws((unsigned char)s.back()))
+        s.pop_back();
+
+    // collapse internal newlines to space (shouldn't exist after cut, but safe)
+    for (char &c : s)
+    {
+        if (c == '\n' || c == '\t')
+            c = ' ';
+    }
+    // collapse double spaces
+    std::string out;
+    out.reserve(s.size());
+    bool prev_space = false;
+    for (char c : s)
+    {
+        bool sp = (c == ' ');
+        if (sp)
+        {
+            if (!prev_space)
+                out.push_back(c);
+        }
+        else
+        {
+            out.push_back(c);
+        }
+        prev_space = sp;
+    }
+    s.swap(out);
+}
+
+int main(int argc, char **argv)
 {
     win32_enable_utf8_console();
 
     std::string model_path;
-    std::string user_prompt = u8"用一句话解释 LR(0) 项目集。";
+    std::string user_question = u8"用一句话解释 LR(0) 项目集。";
 
-    int n_predict = 128;
+    int n_predict = 64; // M1.5：默认更短
     int n_ctx = 2048;
     int n_batch = 512;
-    float temp = 0.2f;
+    float temp = 0.2f; // 短答更稳
     int top_k = 40;
     float top_p = 0.9f;
     int seed = 42;
     bool debug_prompt = false;
 
+    // stop strings: cut off chat leakage / template residue
     std::vector<std::string> stops = {
         "\nHuman:", "\nUser:", "\nassistant:", "\nAssistant:",
-        "<|endoftext|>", "</s>", "<|im_end|>", "<|eot_id|>"};
+        "<|endoftext|>", "</s>", "<|im_end|>", "<|eot_id|>",
+        "\n\n"};
+
+    // 加：中文句子终止符（生成到第一句就停）
+    // 注意：这里是“末尾出现”判定；真正强制只保留一句话，靠后处理 normalize_one_sentence()
+    stops.push_back(u8"。");
+    stops.push_back(u8"！");
+    stops.push_back(u8"？");
+    stops.push_back("\n");
 
     for (int i = 1; i < argc; ++i)
     {
@@ -121,7 +184,7 @@ static int real_main(int argc, char **argv)
                 std::cerr << "Missing value for --prompt\n";
                 return 2;
             }
-            user_prompt = v; // 现在这里一定是 UTF-8 了（wmain 转的）
+            user_question = v;
         }
         else if (a == "--n" || a == "-n")
         {
@@ -204,7 +267,7 @@ static int real_main(int argc, char **argv)
                 << "  llm_cli --model <path.gguf> [--prompt <text>] [--n <tokens>] [--ctx <n>] [--batch <n>]\n"
                 << "          [--temp <f>] [--topk <k>] [--topp <p>] [--seed <n>] [--debug-prompt]\n\n"
                 << "Example:\n"
-                << "  llm_cli --model models\\qwen2.5-3b-instruct-q5_k_m.gguf --prompt \"用一句话解释LR(0)项目集\" --n 64 --temp 0.2\n";
+                << "  llm_cli --model models\\qwen2.5-3b-instruct-q5_k_m.gguf --prompt \"用一句话解释LR(0)项目集\" --n 48 --temp 0.2\n";
             return 0;
         }
     }
@@ -215,8 +278,10 @@ static int real_main(int argc, char **argv)
         return 2;
     }
 
+    // 1) init backend
     llama_backend_init();
 
+    // 2) load model
     llama_model_params mparams = llama_model_default_params();
     llama_model *model = llama_load_model_from_file(model_path.c_str(), mparams);
     if (!model)
@@ -226,6 +291,7 @@ static int real_main(int argc, char **argv)
         return 3;
     }
 
+    // 3) context
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
     cparams.n_batch = n_batch;
@@ -239,25 +305,33 @@ static int real_main(int argc, char **argv)
         return 3;
     }
 
-    // 用 GGUF 自带 chat template
-    std::string system = u8"你是计算机专业课程助教，只能用中文回答。要求：只用一句话，不解释背景，不举例。";
-    std::string user = user_prompt;
+    // 4) 强约束：定义式 + 一句话 + 只输出答案
+    // 关键：不要再让它“解释规则/背景”，把输出格式卡死。
+    std::string system = u8"你是计算机专业课程助教，只能用中文回答。"
+                         u8"输出必须满足："
+                         u8"（1）只输出一句话；（2）必须是定义式；（3）不得出现“好的/请/根据/无法/示例”等套话；"
+                         u8"（4）不得输出换行；（5）不得输出多余标点。";
+    // 把“答案格式”也固定，降低跑偏概率
+    std::string user = u8"请按以下格式回答：\n"
+                       u8"【定义】LR(0)项目集：<一句话定义>。\n"
+                       u8"问题：" +
+                       user_question;
 
     std::vector<llama_chat_message> msgs;
     msgs.push_back({"system", system.c_str()});
     msgs.push_back({"user", user.c_str()});
 
     std::string prompt;
-    prompt.resize(32 * 1024);
+    prompt.resize(64 * 1024);
 
-    int n = llama_chat_apply_template(
-        nullptr,
+    int pn = llama_chat_apply_template(
+        nullptr, // use template stored in GGUF metadata
         msgs.data(),
         (int)msgs.size(),
-        true,
+        true, // add assistant prefix
         prompt.data(),
         (int)prompt.size());
-    if (n < 0)
+    if (pn < 0)
     {
         std::cerr << "llama_chat_apply_template failed\n";
         llama_free(ctx);
@@ -265,18 +339,19 @@ static int real_main(int argc, char **argv)
         llama_backend_free();
         return 6;
     }
-    prompt.resize(n);
+    prompt.resize(pn);
 
     if (debug_prompt)
     {
         std::cerr << "\n[DEBUG PROMPT]\n"
-                  << prompt << "\n[/DEBUG PROMPT]\n";
+                  << prompt.substr(0, 1200) << "\n[/DEBUG PROMPT]\n";
     }
 
+    // 5) tokenize (parse_special=false 更稳)
     const llama_vocab *vocab = llama_model_get_vocab(model);
 
     std::vector<llama_token> tokens;
-    tokens.resize(prompt.size() + 32);
+    tokens.resize(prompt.size() + 64);
 
     int n_prompt = llama_tokenize(
         vocab,
@@ -284,8 +359,9 @@ static int real_main(int argc, char **argv)
         (int)prompt.size(),
         tokens.data(),
         (int)tokens.size(),
-        true,
-        false);
+        true, // add_special
+        false // parse_special
+    );
     if (n_prompt < 0)
     {
         std::cerr << "Tokenize failed\n";
@@ -296,6 +372,7 @@ static int real_main(int argc, char **argv)
     }
     tokens.resize(n_prompt);
 
+    // 6) eval prompt
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     batch.n_tokens = 0;
 
@@ -320,15 +397,18 @@ static int real_main(int argc, char **argv)
         return 5;
     }
 
+    // 7) sampler chain
     llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(-1));
+    // dist sampler：seed 用来让输出更可复现
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist((uint32_t)seed));
 
+    // 8) generation
     std::cout << "\n--- model output ---\n";
-    int n_cur = (int)tokens.size();
 
+    int n_cur = (int)tokens.size();
     std::string out;
     out.reserve((size_t)n_predict * 6);
 
@@ -347,12 +427,14 @@ static int real_main(int argc, char **argv)
 
         out.append(buf, buf + nb);
 
+        // stop early
         if (ends_with_any(out, stops))
         {
-            trim_at_stop(out, stops);
+            trim_at_stop_first_occurrence(out, stops);
             break;
         }
 
+        // feed back
         batch.n_tokens = 0;
         batch.token[batch.n_tokens] = id;
         batch.pos[batch.n_tokens] = n_cur++;
@@ -365,9 +447,26 @@ static int real_main(int argc, char **argv)
             break;
     }
 
-    trim_at_stop(out, stops);
+    // final cleanup & enforce one-sentence
+    trim_at_stop_first_occurrence(out, stops);
+    normalize_one_sentence(out);
+
+    // 如果模型没按格式输出，做一次轻度补救：去掉前导“【定义】”以外的废话
+    // （不做复杂规则，避免把正确内容误删）
+    // 保留从“LR(0)项目集”开始（如果存在）
+    {
+        const std::string key = u8"LR(0)";
+        size_t p = out.find(key);
+        if (p != std::string::npos && p > 0)
+        {
+            out = out.substr(p);
+            normalize_one_sentence(out);
+        }
+    }
+
     std::cout << out << "\n--- end ---\n";
 
+    // 9) cleanup
     llama_batch_free(batch);
     llama_sampler_free(smpl);
     llama_free(ctx);
@@ -375,26 +474,3 @@ static int real_main(int argc, char **argv)
     llama_backend_free();
     return 0;
 }
-
-#ifdef _WIN32
-// Windows：用 wmain 接收 UTF-16 参数，转成 UTF-8 再跑 real_main
-int wmain(int argc, wchar_t **wargv)
-{
-    std::vector<std::string> argv_utf8;
-    argv_utf8.reserve(argc);
-    for (int i = 0; i < argc; ++i)
-        argv_utf8.push_back(wide_to_utf8(wargv[i]));
-
-    std::vector<char *> argv;
-    argv.reserve(argc);
-    for (auto &s : argv_utf8)
-        argv.push_back(s.data());
-
-    return real_main(argc, argv.data());
-}
-#else
-int main(int argc, char **argv)
-{
-    return real_main(argc, argv);
-}
-#endif
