@@ -37,3 +37,16 @@ endif()
 if (MSVC)
   target_compile_options(llm_cli PRIVATE /utf-8 /EHsc)
 endif()
+cmake_minimum_required(VERSION 3.10)
+project(AI_RAG_Engine)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# 添加 SQLiteCpp 作为子目录
+add_subdirectory(libs/SQLiteCpp)
+
+# 你的源文件
+add_executable(ai_rag_engine main.cpp)
+
+# 链接 SQLiteCpp 库
+target_link_libraries(ai_rag_engine SQLiteCpp)
